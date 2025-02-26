@@ -13,8 +13,29 @@ import asyncio
 TOKEN = "7653576698:AAElF2WXPyg-MuxQaxyKeW099noDKLgwlxk"
 NEWS_API_KEY = "d66e7779662147e58f7e2424dfeccbda"
 LLAMA_API_KEY = "d46c1d655d3edcf1d9683516fd77bf1cca208325548071ea73efe47a67806ea6"
+MEDIASTACK_API="fe94d030ca1d0a2556dcf5b564515aba"
+GNEWS_API="1a76969c70467fd2ff1e6757bbf48552"
 
 CACHE_EXPIRY = 900
+
+async def fetch_news_from_sources(query=None):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        
+        # NewsAPI
+        newsapi_url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}" if not query else f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}"
+        tasks.append(fetch_json(session, newsapi_url))
+        
+        # MediaStack API
+        mediastack_url = f"http://api.mediastack.com/v1/news?access_key={MEDIASTACK_API}&countries=us" if not query else f"http://api.mediastack.com/v1/news?access_key={MEDIASTACK_API}&keywords={query}"
+        tasks.append(fetch_json(session, mediastack_url))
+        
+        # GNews API
+        gnews_url = f"https://gnews.io/api/v4/top-headlines?token={GNEWS_API}&lang=en" if not query else f"https://gnews.io/api/v4/search?q={query}&token={GNEWS_API}"
+        tasks.append(fetch_json(session, gnews_url))
+        
+        responses = await asyncio.gather(*tasks)
+        return responses
 
 def is_cache_valid(context: CallbackContext, key: str) -> bool:
     if key in context.user_data and "timestamp" in context.user_data[key]:
@@ -79,80 +100,110 @@ async def get_news(update: Update, context: CallbackContext) -> None:
     if is_cache_valid(context, "latest_news"):
         await update.message.reply_text(context.user_data["latest_news"]["data"])
         return
+
+    responses = await fetch_news_from_sources()
+    is_cyr = is_cyrillic(update.message.text)
     
-    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
-    
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(session, url)
-        is_cyr = is_cyrillic(update.message.text)
-    
-        if data["status"] == "ok":
-            articles = data["articles"][:3]
-            summarized_news = []
-            full_news = ""
-
-            for article in articles:
-                summary = await summarize_text(article["description"] or article["title"], is_cyr)
-                summarized_news.append(f"🔹 {summary}\n{article['url']}")
-                full_news += f"{article['title']}\n{article['description']}\n"
-
-            context.user_data['last_news'] = full_news
-            context.user_data['is_cyr'] = is_cyr
-
-            context.user_data["latest_news"] = {
-                "data": full_news,
-                "timestamp": time.time()
-            }
-
-            news_text = "\n\n".join(summarized_news)
-            await update.message.reply_text(news_text)
+    all_articles = []
+    for data in responses:
+        if not data:
+            continue
+        if "articles" in data: 
+            articles = data["articles"]
+        elif "data" in data: 
+            articles = data["data"]
         else:
-            await update.message.reply_text("Greška pri preuzimanju vijesti. Pokušajte kasnije.")
+            continue
+        
+        for article in articles:
+            item = {
+                "title": article.get("title", "Bez naslova"),
+                "description": article.get("description") or article.get("content") or article.get("title"),
+                "url": article.get("url") or article.get("link")
+            }
+            if item["url"]: 
+                all_articles.append(item)
+
+    # Uklanjanje duplikata
+    seen_urls = set()
+    unique_articles = []
+    for article in all_articles:
+        if article["url"] not in seen_urls:
+            seen_urls.add(article["url"])
+            unique_articles.append(article)
+    
+    if not unique_articles:
+        await update.message.reply_text("Trenutno nema dostupnih vesti.")
+        return
+
+    summarized_news = []
+    full_news = ""
+    for article in unique_articles[:5]: 
+        summary_text = article["description"] or article["title"]
+        summary = await summarize_text(summary_text, is_cyr)
+        summarized_news.append(f"🔹 {summary}\n{article['url']}")
+        full_news += f"{article['title']}\n{article['description']}\n\n"
+
+    context.user_data['last_news'] = full_news
+    context.user_data['is_cyr'] = is_cyr
+
+    context.user_data["latest_news"] = {
+        "data": "\n\n".join(summarized_news),
+        "timestamp": time.time()
+    }
+
+    await update.message.reply_text(context.user_data["latest_news"]["data"])
 
 async def search_news(update: Update, context: CallbackContext) -> None:
-    query = update.message.text
-    print(f"Korisnički upit: {query}")  
+    query = ' '.join(context.args) if context.args else update.message.text
+    print(f"Pretraga za: {query}")
 
-    url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}"
-
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_json(session, url)
-        print(f"API odgovor: {data}")  
-
-        if data["status"] != "ok" or not data.get("articles"):
-            await update.message.reply_text("Nema rezultata za ovu pretragu.")
-            return
-
-        articles = data["articles"][:3]
-        summarized_news = []
-        full_news = ""  # Ovaj string će čuvati pune vesti
-
+    responses = await fetch_news_from_sources(query)
+    is_cyr = is_cyrillic(update.message.text)
+    
+    all_articles = []
+    for data in responses:
+        if not data:
+            continue
+        if "articles" in data:
+            articles = data["articles"]
+        elif "data" in data:
+            articles = data["data"]
+        else:
+            continue
+        
         for article in articles:
-            title = article.get("title", "Bez naslova")
-            description = article.get("description", title)  # Ako nema opisa, koristi naslov
-            print(f"Originalna vest: {title} - {description}")  
+            item = {
+                "title": article.get("title", "Bez naslova"),
+                "description": article.get("description") or article.get("content") or article.get("title"),
+                "url": article.get("url") or article.get("link")
+            }
+            if item["url"]:
+                all_articles.append(item)
 
-            summary = await summarize_text(description, is_cyrillic(update.message.text))
-            print(f"Sažetak:")
+    # Filtriranje po relevanciji
+    query_lower = query.lower()
+    filtered_articles = [
+        a for a in all_articles
+        if query_lower in (a["title"] + a["description"]).lower()
+    ][:10]  # Limitiraj za performanse
 
-            if not summary.strip():
-                continue
+    if not filtered_articles:
+        await update.message.reply_text("Nema rezultata za ovu pretragu.")
+        return
 
-            summarized_news.append(f"🔹 {summary}\n{article['url']}")
-            full_news += f"{title}\n{description}\n"
+    summarized_news = []
+    full_news = ""
+    for article in filtered_articles[:5]:
+        summary_text = article["description"] or article["title"]
+        summary = await summarize_text(summary_text, is_cyr)
+        summarized_news.append(f"🔹 {summary}\n{article['url']}")
+        full_news += f"{article['title']}\n{article['description']}\n\n"
 
-        if not summarized_news:
-            await update.message.reply_text("Nema relevantnih vesti za ovu pretragu.")
-            return
+    context.user_data['last_news'] = full_news
+    context.user_data['is_cyr'] = is_cyr
 
-        # Čuvamo pretražene vesti u user_data
-        context.user_data["last_news"] = full_news
-        context.user_data["is_cyr"] = is_cyrillic(update.message.text)
-
-        news_text = "\n\n".join(summarized_news)
-        print(f"Finalni tekst za slanje")  
-
-        await update.message.reply_text(news_text)
+    await update.message.reply_text("\n\n".join(summarized_news))
 
 async def handle_follow_up(update: Update, context: CallbackContext) -> None:
     if 'last_news' not in context.user_data:
@@ -166,7 +217,7 @@ async def handle_follow_up(update: Update, context: CallbackContext) -> None:
             context.args = key_words 
             await search_news(update, context)
         else:
-            await update.message.reply_text("Nema dovoljno informacija za pretragu vesti. Molim vas, pokušajte ponovo.")
+            await update.message.reply_text("Nema dovoljno informacija za pretragu vijesti. Molim vas, pokušajte ponovo.")
         return
 
     question = convert_to_latin(update.message.text)
