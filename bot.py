@@ -14,7 +14,7 @@ TOKEN = "7653576698:AAElF2WXPyg-MuxQaxyKeW099noDKLgwlxk"
 NEWS_API_KEY = "d66e7779662147e58f7e2424dfeccbda"
 LLAMA_API_KEY = "d46c1d655d3edcf1d9683516fd77bf1cca208325548071ea73efe47a67806ea6"
 
-CACHE_EXPIRY=900
+CACHE_EXPIRY = 900
 
 def is_cache_valid(context: CallbackContext, key: str) -> bool:
     if key in context.user_data and "timestamp" in context.user_data[key]:
@@ -36,14 +36,18 @@ def convert_to_latin(text: str) -> str:
 async def start(update: Update, context: CallbackContext) -> None:
     welcome_message = """
     Zdravo! Ja sam AI News bot. Evo šta možeš da uradiš:
-    - /news - Daj mi najnovije vesti.
-    - /search [ključne reči] - Pretražuj vijesti prema ključnim riječima (npr. /search technology ili /search политика).
-    - Postavi pitanje o poslednjim vestima nakon što ih dobiješ.
+    - Recite "Želim nove vijesti", "Daj mi najnovije vesti" ili slično za najnovije vijesti
+    - Recite "[ključne riječi]" ili [pojam]" za pretragu vijesti
+    - Postavi pitanje o poslednjim vestima nakon što ih dobiješ
+    - /reset - Restartuj konverzaciju i počni iznova
     """
     await update.message.reply_text(welcome_message)
 
+async def reset(update: Update, context: CallbackContext) -> None:
+    context.user_data.clear()
+    await update.message.reply_text("Konverzacija je resetovana. Možete početi iznova.")
+
 async def fetch_json(session, url, headers=None, params=None, data=None, method="GET"):
-    """Opšta funkcija za asinhrone HTTP zahteve."""
     async with session.request(method, url, headers=headers, params=params, json=data) as response:
         return await response.json()
 
@@ -72,7 +76,6 @@ async def summarize_text(text: str, is_cyr: bool) -> str:
     return "API je preopterećen. Pokušajte kasnije. 😕"
 
 async def get_news(update: Update, context: CallbackContext) -> None:
-    """ Dobavlja  i kesira najnovije vijesti """
     if is_cache_valid(context, "latest_news"):
         await update.message.reply_text(context.user_data["latest_news"]["data"])
         return
@@ -81,7 +84,6 @@ async def get_news(update: Update, context: CallbackContext) -> None:
     
     async with aiohttp.ClientSession() as session:
         data = await fetch_json(session, url)
-
         is_cyr = is_cyrillic(update.message.text)
     
         if data["status"] == "ok":
@@ -108,53 +110,64 @@ async def get_news(update: Update, context: CallbackContext) -> None:
             await update.message.reply_text("Greška pri preuzimanju vijesti. Pokušajte kasnije.")
 
 async def search_news(update: Update, context: CallbackContext) -> None:
-    """Pretražuje vijesti na osnovu ključnih reči"""
-    if len(context.args) == 0:
-        await update.message.reply_text("Molim te, unesite ključne riječi za pretragu vesti. Na primer: /search technology")
-        return
-    
-    query = " ".join(context.args)
+    query = update.message.text
+    print(f"Korisnički upit: {query}")  
 
-    cache_key = f"search_{query.lower()}"
-    if is_cache_valid(context, cache_key):
-        await update.message.reply_text(context.user_data[cache_key]["data"])
-        return
-    
     url = f"https://newsapi.org/v2/everything?q={query}&apiKey={NEWS_API_KEY}"
-    response = requests.get(url)
-    data = response.json()
-    is_cyr = is_cyrillic(update.message.text)
-    if data["status"] == "ok":
+
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(session, url)
+        print(f"API odgovor: {data}")  
+
+        if data["status"] != "ok" or not data.get("articles"):
+            await update.message.reply_text("Nema rezultata za ovu pretragu.")
+            return
+
         articles = data["articles"][:3]
         summarized_news = []
-        full_news=""
-        
+        full_news = ""  # Ovaj string će čuvati pune vesti
+
         for article in articles:
-            summary = await summarize_text(article["description"] or article["title"], is_cyr)
-            summarized_news.append(f"🔹{summary}\n{article['url']}")
-            full_news+=f"{article['title']}\n{article['description']}\n"
+            title = article.get("title", "Bez naslova")
+            description = article.get("description", title)  # Ako nema opisa, koristi naslov
+            print(f"Originalna vest: {title} - {description}")  
 
-        context.user_data['last_news']=full_news
-        context.user_data['is_cyr']=is_cyr
+            summary = await summarize_text(description, is_cyrillic(update.message.text))
+            print(f"Sažetak:")
+
+            if not summary.strip():
+                continue
+
+            summarized_news.append(f"🔹 {summary}\n{article['url']}")
+            full_news += f"{title}\n{description}\n"
+
+        if not summarized_news:
+            await update.message.reply_text("Nema relevantnih vesti za ovu pretragu.")
+            return
+
+        # Čuvamo pretražene vesti u user_data
+        context.user_data["last_news"] = full_news
+        context.user_data["is_cyr"] = is_cyrillic(update.message.text)
+
         news_text = "\n\n".join(summarized_news)
+        print(f"Finalni tekst za slanje")  
 
-        context.user_data[cache_key] = {
-                "data": news_text,
-                "timestamp": time.time()
-            }
-        
         await update.message.reply_text(news_text)
-    else:
-        await update.message.reply_text("Greška pri pretrazi vijesti. Pokušajte kasnije.")
 
 async def handle_follow_up(update: Update, context: CallbackContext) -> None:
-    """Odgovara na podpitanja koristeći sačuvane vesti."""
     if 'last_news' not in context.user_data:
-        await update.message.reply_text("Nema sačuvanih vesti. Koristite /news da dobijete najnovije vijesti prvo.")
+        question = update.message.text
+        words = question.split()
+        
+        stop_words = {"šta", "kako", "gde", "ko", "kada", "zašto", "mi", "ne", "se", "to"}
+        key_words = [word for word in words if word.lower() not in stop_words]
+
+        if key_words:
+            context.args = key_words 
+            await search_news(update, context)
+        else:
+            await update.message.reply_text("Nema dovoljno informacija za pretragu vesti. Molim vas, pokušajte ponovo.")
         return
-    
-    language = detect_language(update.message.text)
-    context.user_data['language']=language
 
     question = convert_to_latin(update.message.text)
     full_news = context.user_data['last_news']
@@ -170,52 +183,51 @@ async def handle_follow_up(update: Update, context: CallbackContext) -> None:
         ]
     }
     
-    response = requests.post(url, headers=headers, data=json.dumps(data))
-    response_json = response.json()
+    async with aiohttp.ClientSession() as session:
+        response_json = await fetch_json(session, url, headers=headers, data=data, method="POST")
     
-    if "choices" in response_json and response_json["choices"]:
-        answer = response_json["choices"][0]["message"]["content"].strip()
-        answer = transliterate.translit(answer, 'sr') if is_cyr else answer
-        await update.message.reply_text(answer)
-    else:
-        await update.message.reply_text("Nisam uspeo da pronađem odgovor. 😕")
+        if "choices" in response_json and response_json["choices"]:
+            answer = response_json["choices"][0]["message"]["content"].strip()
+            answer = transliterate.translit(answer, 'sr') if is_cyr else answer
+            await update.message.reply_text(answer)
+        else:
+            await update.message.reply_text("Nisam uspio da pronađem odgovor. 😕")
 
 async def handle_news_request(update: Update, context: CallbackContext) -> None:
+    if not update.message:
+        return
+    print(f"Primljen update: {update.to_dict()}")
     text = update.message.text
-    is_cyr = is_cyrillic(text)
-    text = convert_to_latin(text)
+    converted_text = convert_to_latin(text).lower()
+
+    news_patterns = [
+        r"^(želim nove vijesti|daj mi nove vijesti|novosti|nove vesti|danasnje vesti|vesti danas|daj mi najnovije vesti|news|latest news|nove vijesti)$",
+        r"\b(najnovije vesti|novosti|vijesti danas|nove vijesti)\b"
+    ]
     
-    patterns = [r"(danasnje vesti|vesti danas|daj mi najnovije vesti|news|latest news)"]
-    for pattern in patterns:
-        if re.search(pattern, text, re.IGNORECASE): 
+    for pattern in news_patterns:
+        if re.search(pattern, converted_text, re.IGNORECASE):
             await get_news(update, context)
             return
-    
+
+    search_match = re.match(r"^(nađi mi|traži| ||zanima me|kako se to|pretraži|search|find)\s+(.+)", converted_text, re.IGNORECASE)
+    if search_match:
+        context.args = search_match.group(2).split()
+        await search_news(update, context)
+        return
+
     await handle_follow_up(update, context)
 
-async def last_news(update: Update, context: CallbackContext) -> None:
-    if 'last_news' not in context.user_data:
-        await update.message.reply_text("Nema sačuvanih vesti.")
-        return
-    await update.message.reply_text(context.user_data['last_news'])
 
-
-# Glavna funkcija za pokretanje bota
 def main():
     app = Application.builder().token(TOKEN).build()
     
-    # Dodajemo komande
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("news", get_news))
-    app.add_handler(CommandHandler("search", search_news))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_news_request))
 
-    
-    # Pokrećemo bota
     print("Bot je pokrenut...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
-    
