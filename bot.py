@@ -8,7 +8,6 @@ import transliterate
 from langdetect import detect
 import aiohttp
 import asyncio 
-import openai
 
 # API ključevi
 TOKEN = "7653576698:AAElF2WXPyg-MuxQaxyKeW099noDKLgwlxk"
