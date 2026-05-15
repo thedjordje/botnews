@@ -1,44 +1,74 @@
-import os
-import json
-import time
-import re
 import asyncio
+import json
+import logging
+import os
+import re
+import time
+from typing import Any
+from urllib.parse import quote_plus
+
 import aiohttp
-from typing import List, Dict
-from pydantic import BaseModel
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-from groq import Groq
-from langdetect import detect
 import transliterate
 from dotenv import load_dotenv
+from groq import Groq
+from langdetect import detect
+from langdetect.lang_detect_exception import LangDetectException
+from pydantic import BaseModel
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CallbackContext,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-GROQ_API = os.getenv("GROQ_API_KEY")
+TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+GROQ_API = os.getenv("GROQ_API_KEY", "")
+GNEWS_API_KEY = os.getenv("GNEWS_API", "")
 GROQ_MODEL = "llama3-70b-8192"
 CACHE_EXPIRY = 600  # 10 minutes
 MAX_ARTICLES = 5
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("botnews")
+
+
+def build_newsapi_url(query: str | None) -> str:
+    if query:
+        return (
+            "https://newsapi.org/v2/everything"
+            f"?q={quote_plus(query)}&language=en&apiKey={NEWS_API_KEY}"
+        )
+    return f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
+
+
+def build_gnews_url(query: str | None) -> str:
+    if query:
+        return (
+            "https://gnews.io/api/v4/search"
+            f"?q={quote_plus(query)}&token={GNEWS_API_KEY}&lang=en"
+        )
+    return f"https://gnews.io/api/v4/top-headlines?token={GNEWS_API_KEY}&lang=en"
+
 NEWS_APIS = [
     {
         "name": "NewsAPI",
-        "url": lambda q: f"https://newsapi.org/v2/{'everything' if q else 'top-headlines'}?q={q}&language=en&apiKey={NEWS_API_KEY}" if q else f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}",
-        "parser": lambda data: data.get("articles", [])
+        "url": build_newsapi_url,
+        "parser": lambda data: data.get("articles", []),
     },
     {
         "name": "GNews",
-        "url": lambda q: f"https://gnews.io/api/v4/{'search' if q else 'top-headlines'}?q={q}&token={os.getenv('GNEWS_API')}&lang=en",
-        "parser": lambda data: data.get("articles", [])
-    }
+        "url": build_gnews_url,
+        "parser": lambda data: data.get("articles", []),
+    },
 ]
-
-class Tool(BaseModel):
-    name: str
-    description: str
-    parameters: dict
 
 class ToolCall(BaseModel):
     name: str
@@ -86,8 +116,35 @@ NEWS_TOOLS = [
 def is_cyrillic(text: str) -> bool:
     return bool(re.search("[\u0400-\u04FF]", text))
 
+
+def safe_detect_language(text: str) -> str:
+    try:
+        return detect(text)
+    except (LangDetectException, TypeError):
+        return "en"
+
+
 def format_response(text: str, is_cyr: bool) -> str:
     return transliterate.translit(text, 'sr') if is_cyr else text
+
+
+def normalize_articles(raw_articles: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for article in raw_articles:
+        title = (article.get("title") or "").strip()
+        description = (article.get("description") or "").strip()
+        url = (article.get("url") or "").strip()
+        if not title or not url:
+            continue
+        normalized.append(
+            {
+                "title": title,
+                "description": description,
+                "url": url,
+            }
+        )
+    return normalized
+
 
 class NewsBot:
     def __init__(self):
@@ -113,32 +170,47 @@ class NewsBot:
                 tools=[{"type": "function", "function": tool} for tool in self.available_tools],
                 tool_choice="auto"
             )
-            
-            tool_call = response.choices[0].message.tool_calls[0]
+
+            tool_calls = response.choices[0].message.tool_calls or []
+            if not tool_calls:
+                return self._fallback_tool_selection(user_input)
+
+            tool_call = tool_calls[0]
             return ToolCall(
                 name=tool_call.function.name,
                 arguments=json.loads(tool_call.function.arguments))
         except Exception as e:
-            print(f"Error selecting tool: {e}")
-            return ToolCall(name="general_qa", arguments={"question": user_input})
+            logger.exception("Error selecting tool: %s", e)
+            return self._fallback_tool_selection(user_input)
+
+    def _fallback_tool_selection(self, user_input: str) -> ToolCall:
+        lowered = user_input.lower()
+        if any(keyword in lowered for keyword in ("news", "headlines", "latest")):
+            return ToolCall(name="get_news", arguments={})
+        return ToolCall(name="search_news", arguments={"query": user_input})
 
     async def execute_tool(self, tool_call: ToolCall, context: dict) -> str:
         """Executes the selected tool."""
         if tool_call.name == "get_news":
             return await self._handle_get_news(context)
-        elif tool_call.name == "search_news":
-            return await self._handle_search_news(tool_call.arguments['query'], context)
-        elif tool_call.name == "general_qa":
-            return await self._handle_general_qa(tool_call.arguments['question'], context)
-        else:
-            return "I couldn't process your request."
+        if tool_call.name == "search_news":
+            query = tool_call.arguments.get("query", "")
+            if not query:
+                return "Please provide a topic to search for."
+            return await self._handle_search_news(query, context)
+        if tool_call.name == "general_qa":
+            question = tool_call.arguments.get("question", "")
+            if not question:
+                return "Please provide a question."
+            return await self._handle_general_qa(question, context)
+        return "I couldn't process your request."
 
     async def _handle_get_news(self, context: dict) -> str:
         """Handles general news requests."""
         articles = await self.fetch_news()
         if not articles:
             return "No news available at the moment."
-        
+
         summaries = []
         full_text = ""
         for article in articles:
@@ -147,14 +219,14 @@ class NewsBot:
                 is_cyrillic(article.get('title', '')))
             summaries.append(f"📰 {summary}\n{article.get('url', '')}")
             full_text += f"{article.get('title')}\n{article.get('description')}\n\n"
-        
+
         # Update context
         context.update({
             'last_news': full_text,
             'timestamp': time.time(),
             'last_news_topic': 'general'
         })
-        
+
         return "\n\n".join(summaries)
 
     async def _handle_search_news(self, query: str, context: dict) -> str:
@@ -162,14 +234,14 @@ class NewsBot:
         articles = await self.fetch_news(query)
         if not articles:
             return f"No results found for: {query}"
-        
+
         # Update context
         context.update({
             'last_news': "\n".join([f"{a['title']}: {a['description']}" for a in articles]),
             'timestamp': time.time(),
             'last_news_topic': query
         })
-        
+
         # Format response
         summaries = [
             f"📌 {await self.summarize(a['title'], is_cyrillic(a['title']))}\n{a['url']}"
@@ -188,7 +260,7 @@ class NewsBot:
         """Answers follow-up questions based on previous news context."""
         try:
             news_context = context.get('last_news', '')[:2000]
-            user_lang = detect(question)
+            user_lang = safe_detect_language(question)
             response = await asyncio.to_thread(
                 self.groq_client.chat.completions.create,
                 model=GROQ_MODEL,
@@ -197,26 +269,26 @@ class NewsBot:
                     {"role": "user", "content": question}
                 ]
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content or "No answer available."
         except Exception as e:
-            print(f"Error answering follow-up: {e}")
+            logger.exception("Error answering follow-up: %s", e)
             return "An error occurred while processing your question."
 
     async def generate_general_response(self, question: str) -> str:
         """Generates a general response for non-news-related questions."""
         try:
-            user_lang = detect(question)
+            user_lang = safe_detect_language(question)
             response = await asyncio.to_thread(
                 self.groq_client.chat.completions.create,
                 model=GROQ_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "system", "content": f"You are a helpful assistant. Respond in {user_lang}."},
                     {"role": "user", "content": question}
                 ]
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content or "No answer available."
         except Exception as e:
-            print(f"Error generating general response: {e}")
+            logger.exception("Error generating general response: %s", e)
             return "I couldn't generate a response for your question."
 
     async def fetch_news(self, query: str = None) -> list:
@@ -226,18 +298,22 @@ class NewsBot:
             for api in NEWS_APIS:
                 url = api["url"](query)
                 tasks.append(self._fetch_api(session, url, api["parser"]))
-            
+
             results = await asyncio.gather(*tasks)
-            return [item for sublist in results for item in sublist][:MAX_ARTICLES]
+            articles = [item for sublist in results for item in sublist]
+            return normalize_articles(articles)[:MAX_ARTICLES]
 
     async def _fetch_api(self, session, url, parser):
         """Fetches data from a single API."""
         try:
-            async with session.get(url) as response:
+            async with session.get(url, timeout=10) as response:
+                if response.status >= 400:
+                    logger.warning("News API returned status %s for %s", response.status, url)
+                    return []
                 data = await response.json()
                 return parser(data)
         except Exception as e:
-            print(f"Error fetching {url}: {e}")
+            logger.exception("Error fetching %s: %s", url, e)
             return []
 
     async def summarize(self, text: str, is_cyr: bool) -> str:
@@ -252,9 +328,10 @@ class NewsBot:
                 ],
                 temperature=0.5
             )
-            return format_response(response.choices[0].message.content, is_cyr)
+            content = response.choices[0].message.content or "I couldn't summarize this article."
+            return format_response(content, is_cyr)
         except Exception as e:
-            print(f"Error summarizing text: {e}")
+            logger.exception("Error summarizing text: %s", e)
             return format_response("I couldn't summarize this article.", is_cyr)
 
 # Telegram handlers
@@ -283,33 +360,51 @@ async def reset(update: Update, context: CallbackContext) -> None:
     await start(update, context)
 
 async def handle_message(update: Update, context: CallbackContext):
-    user_input = update.message.text
+    user_input = (update.message.text or "").strip()
+    if not user_input:
+        await update.message.reply_text("Please send a text message.")
+        return
+
     is_cyr = is_cyrillic(user_input)
-    
+
     tool_call = await news_bot.select_tool(user_input, context.user_data)
-    
+
     response = await news_bot.execute_tool(tool_call, context.user_data)
-    
+
     await update.message.reply_text(format_response(response, is_cyr))
-    
+
     if tool_call.name in ['get_news', 'search_news']:
         context.user_data['last_news_topic'] = tool_call.arguments.get('query', 'general')
 
+
+def validate_environment() -> None:
+    required = {
+        "TELEGRAM_TOKEN": TOKEN,
+        "GROQ_API_KEY": GROQ_API,
+    }
+
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        missing_keys = ", ".join(missing)
+        raise RuntimeError(f"Missing required environment variables: {missing_keys}")
+
+
 def main():
     try:
+        validate_environment()
         app = Application.builder().token(TOKEN).build()
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("reset", reset))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        print("Bot started successfully!")
+
+        logger.info("Bot started successfully")
         app.run_polling()
     except Exception as e:
-        print(f"Critical error: {str(e)}")
-        print("Check the following:")
-        print("- Is the .env file present?")
-        print("- Are the API keys valid?")
-        print("- Is the internet connection stable?")
+        logger.error("Critical error: %s", str(e))
+        logger.info("Check the following:")
+        logger.info("- Is the .env file present?")
+        logger.info("- Are the API keys valid?")
+        logger.info("- Is the internet connection stable?")
 
 if __name__ == "__main__":
     main()
